@@ -56,3 +56,8 @@ dev_tools/
 
 benchmark.json
 .run-logs/
+
+# sglang-omni backend: local launcher state
+run/
+logs/
+scripts/sglang_omni_local.env

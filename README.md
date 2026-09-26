@@ -90,6 +90,7 @@ Browser -> Gateway -> Python Worker -> Backend
 - **Gateway** is the public HTTPS/WebSocket entrypoint. It does not load the model; it handles routing, queueing, session recording, and worker health checks.
 - **Python Worker** exposes the worker WebSocket/health API, owns worker state, and forwards runtime protocol messages to a backend server.
 - **Backend** runs the model. The backend can be the PyTorch implementation (`py_backend/server.py`) or the C++ implementation (`llama-omni-server` from `llama.cpp-omni`).
+  It can also be an existing [sglang-omni](https://github.com/sgl-project/sglang-omni) server, bridged by `sglang_omni_backend/` (full-duplex only; see `sglang_omni_backend/BACKEND.md`).
 
 **Docker Deployment (Recommended)**
 
@@ -132,6 +133,19 @@ docker compose -f docker-compose.cpp.yml logs -f cpp-worker-backend
 ```
 
 For the C++ backend, `docker-compose.cpp.yml` is the intended entrypoint. It uses the C++ worker image defined by `docker/Dockerfile.cpp-worker-backend` and `docker/entrypoint-cpp-worker-backend.sh`. Read those files for the exact llama.cpp-omni ref, backend command, and default `LLAMA_SERVER_EXTRA_ARGS`.
+
+**sglang-omni backend via Compose** (the sglang-omni server with the model runs separately; this container needs no GPU):
+
+```bash
+mkdir -p certs data
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout certs/key.pem -out certs/cert.pem -subj "/CN=minicpm-o"
+
+UPSTREAM_URL=ws://host.docker.internal:18260/v1/realtime \
+docker compose -f docker-compose.sglang-omni.yml up -d --build
+```
+
+Bare metal: `scripts/sglang_omni_local.sh start` (settings in `scripts/sglang_omni_local.env`, see the script header).
 
 **Bare-metal deployment:**
 

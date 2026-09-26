@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+#
+# sglang-omni worker + backend bundle image (no GPU, no model weights, no torch).
+#
+# One container runs:
+#   - sglang_omni_backend on 127.0.0.1:${BACKEND_PORT:-22500}, forwarding every session to an
+#     existing sglang-omni server's /v1/realtime (UPSTREAM_URL)
+#   - worker.py on 0.0.0.0:${WORKER_PORT:-22400}, forwarding to the local backend
+#
+# The sglang-omni server (which holds the model and the GPU) runs elsewhere.
+
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# worker.py dependencies (same set as Dockerfile.cpp-worker-backend) + aiohttp for the backend
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+        "fastapi>=0.128.0" \
+        "httpx>=0.28.0" \
+        "numpy>=2.2.0" \
+        "pydantic>=2.11.0" \
+        python-multipart \
+        "uvicorn>=0.40.0" \
+        "websockets>=16.0" \
+        "aiohttp>=3.9"
+
+COPY . .
+
+RUN chmod +x docker/entrypoint-sglang-omni-worker-backend.sh \
+    && mkdir -p /app/logs
+
+EXPOSE 22400
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=40 \
+    CMD curl -sf "http://127.0.0.1:${WORKER_PORT:-22400}/health" >/dev/null || exit 1
+
+ENTRYPOINT ["docker/entrypoint-sglang-omni-worker-backend.sh"]

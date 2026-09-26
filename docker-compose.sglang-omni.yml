@@ -1,0 +1,78 @@
+# MiniCPM-o demo served by an existing sglang-omni server (docker compose)
+#
+# Topology:
+#   gateway                   x1   host 127.0.0.1:${GATEWAY_HOST_PORT:-8006} -> container :8006
+#   sglang-omni-worker-backend x1  one container, no GPU:
+#       - sglang_omni_backend on 127.0.0.1:22500 -> ${UPSTREAM_URL} (sglang-omni /v1/realtime)
+#       - Python worker on 0.0.0.0:22400, forwarding to the local backend
+#
+# The sglang-omni server runs outside this compose project (it owns the model and the GPU), e.g.
+#   python -m sglang_omni.cli serve --model-path openbmb/MiniCPM-o-4_5 --enable-realtime --host 0.0.0.0 --port 18260 ...
+#
+# Usage:
+#   mkdir -p certs data
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#     -keyout certs/key.pem -out certs/cert.pem -subj "/CN=minicpm-o"
+#   UPSTREAM_URL=ws://host.docker.internal:18260/v1/realtime \
+#   docker compose -f docker-compose.sglang-omni.yml up -d --build
+#   docker compose -f docker-compose.sglang-omni.yml logs -f sglang-omni-worker-backend
+#
+# See sglang_omni_backend/BACKEND.md for the protocol mapping and what is not supported.
+
+services:
+  sglang-omni-worker-backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sglang-omni-worker-backend
+    image: minicpm-sglang-omni-worker-backend:dev
+    environment:
+      UPSTREAM_URL: "${UPSTREAM_URL:?set UPSTREAM_URL to the sglang-omni /v1/realtime URL}"
+      BACKEND_PORT: "22500"
+      WORKER_PORT: "22400"
+      MAX_SESSIONS: "1"
+      BACKEND_EXTRA_ARGS: "${BACKEND_EXTRA_ARGS:-}"
+      GATEWAY_REGISTRY_URL: "http://gateway:8007/internal/workers"
+      WORKER_ID: "sglang-omni-worker-backend"
+      WORKER_ENDPOINT: "sglang-omni-worker-backend:22400"
+      WORKER_GPU_GROUP: "sglang-omni"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:22400/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    image: minicpm-gateway:dev
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8006"
+      - "--internal-port"
+      - "8007"
+      - "--https"
+      - "--ssl-certfile"
+      - "/app/certs/cert.pem"
+      - "--ssl-keyfile"
+      - "/app/certs/key.pem"
+    ports:
+      - "127.0.0.1:${GATEWAY_HOST_PORT:-8006}:8006"
+    expose:
+      - "8007"
+    volumes:
+      - ${DATA_HOST_PATH:-./data}:/app/data
+      - ${CERTS_HOST_PATH:-./certs}:/app/certs:ro
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
