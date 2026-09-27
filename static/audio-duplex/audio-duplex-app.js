@@ -31,6 +31,9 @@ import {
 import { startDingDongLoop, playAlarmBell, playSessionChime } from '../duplex/lib/queue-chimes.js';
 import { createTtsRefController } from '../duplex/ui/tts-ref-controller.js';
 import { initRefAudio } from '../duplex/ui/ref-audio-init.js';
+import { mountSamplingControls } from '../duplex/ui/sampling-controls.js';
+
+const samplingControls = mountSamplingControls('duplexLengthPenalty');
 
 // ============================================================================
 // Constants & State
@@ -860,7 +863,10 @@ async function startSession() {
     };
     session.onSpeakEnd = () => scrollChatLog();
     session.onListenResult = (result) => { if (result.text) addUserLog(result.text); };
-    session.onRunningChange = (running) => setDuplexButtonStates(running);
+    session.onRunningChange = function (running) {
+        setDuplexButtonStates(running);
+        samplingControls.setRunning(running, this.backendInfo);
+    };
     session.onPauseStateChange = (state) => {
         setDefaultPauseBtnState(state);
         if (session && session.running) {
@@ -966,7 +972,7 @@ async function startSession() {
 
     // Build prepare payload
     const preparePayload = {
-        config: { length_penalty: parseFloat(document.getElementById('duplexLengthPenalty').value) || 1.05 },
+        config: { ...samplingControls.read(), length_penalty: parseFloat(document.getElementById('duplexLengthPenalty').value) || 1.05 },
         use_tts: document.getElementById('ttsEnabled').checked,
     };
     const refBase64 = refAudio.getBase64();

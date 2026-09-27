@@ -1,6 +1,6 @@
 # sglang-omni backend for the MiniCPM-o demo
 
-This directory is a drop-in replacement for `py_backend/server.py`: a backend-protocol server whose inference runs on a separate [sglang-omni](https://github.com/sgl-project/sglang-omni) server through its native full-duplex `/v1/realtime` WebSocket. Gateway, worker and pages are unchanged; the worker is pointed at this process with `--backend-server-url`, the same way `docker-compose.cpp.yml` swaps in the C++ backend.
+This directory is a drop-in replacement for `py_backend/server.py`: a backend-protocol server whose inference runs on a separate [sglang-omni](https://github.com/sgl-project/sglang-omni) server through its native full-duplex `/v1/realtime` WebSocket. Gateway and worker transport are unchanged; the audio/video pages expose shared sampling controls; the worker is pointed at this process with `--backend-server-url`, the same way `docker-compose.cpp.yml` swaps in the C++ backend.
 
 ```text
 Browser -> gateway.py (/v1/realtime) -> worker.py (/v1/worker/duplex) -> sglang_omni_backend (/backend) -> sglang-omni (/v1/realtime)
@@ -57,15 +57,15 @@ So everything below is what `runtime/backend_client.py::RemoteBackendSession` se
 | `mode` | `full_duplex` or `turn_based` (`server.py:608`) | `full_duplex` only; `turn_based` (the gateway's `mode=chat`, `/turnbased` page) is refused fail-fast with a diagnostic |
 | `system_prompt` / `instructions` | system prompt, default `You are a helpful assistant.` (`server.py:275-279`) | `session.update.session.instructions`; omitted when empty, so the server's default applies |
 | `use_tts` | not read by py_backend | `false` → `output_modalities: ["text"]`, else `["audio"]` |
-| `voice.*`, `ref_audio_base64`, `tts_ref_audio_base64`, `ref_audio_path` | LLM and TTS reference audio (`server.py:258-271`, `py_backend/voice.py`) | **ignored**: `/v1/realtime` has no voice field; the server's configured voice is used. Listed in `session.created.sglang.ignored_init_fields` |
-| `config` (sampling, `length_penalty`, ...) | `set_duplex_config` (`server.py:254-256`; field list schema §6) | **ignored** (server-side sampling config applies); listed as ignored |
-| `max_slice_nums` | vision HD slices (schema §4.3) | ignored |
+| `voice.*`, `ref_audio_base64`, `tts_ref_audio_base64`, `ref_audio_path` | LLM and TTS reference audio (`server.py:258-271`, `py_backend/voice.py`) | Uploaded 16 kHz float32 references are converted to PCM16 WAV and sent as `session.sglang.reference_audio` / `tts_reference_audio`. Separate TTS reference takes precedence; otherwise upstream uses the main reference, then its deployment default. File paths are rejected. |
+| `config` (sampling, `length_penalty`, ...) | `set_duplex_config` (`server.py:254-256`; field list schema §6) | `temperature`, `top_k`, `top_p`, `listen_prob_scale`, `force_listen_count` and `greedy` map to `session.sglang.sampling`. `decode_mode` maps to `greedy`; `text_repetition_penalty` maps to `repetition_penalty`. Other keys, including `length_penalty`, are listed individually as unsupported and shown in the page log. |
+| `max_slice_nums` | vision HD slices (schema §4.3) | Forwarded as `session.sglang.max_slice_nums`; fixed for the session. Stop and restart to change HD. |
 
-Open sequence here: connect `UPSTREAM_URL` → wait `session.created` → `session.update {output_modalities, instructions}` → wait `session.updated` and read `session.sglang.granted` (checks 16 kHz in / 24 kHz out and `native_full_duplex`; takes `native_unit_ms`, `input_modalities`, `input_image_format.max_bytes`) → reply
+Open sequence here: connect `UPSTREAM_URL` → wait `session.created` → `session.update {output_modalities, instructions, sglang}` → wait `session.updated` and read `session.sglang.granted` (checks 16 kHz in / 24 kHz out and `native_full_duplex`; takes `native_unit_ms`, `input_modalities`, `input_image_format.max_bytes`) → reply
 
 ```json
 {"type": "session.created", "session_id": "sess_<12 hex>", "mode": "full_duplex", "metrics": {"backend": "sglang-omni"},
- "sglang": {"upstream_session_id": "...", "native_unit_ms": 1000, "image_input": true, "output_modalities": ["audio"], "ignored_init_fields": ["config", "ref_audio_base64"]}, "server_send_ts": 1.7e9}
+ "sglang": {"upstream_session_id": "...", "native_unit_ms": 1000, "image_input": true, "output_modalities": ["audio"], "max_images_per_unit": 4, "max_slice_nums": 1, "fixed_settings": ["max_slice_nums"], "ignored_init_fields": ["config.length_penalty"]}, "server_send_ts": 1.7e9}
 ```
 
 Any upstream failure during open is fatal (see §6).
@@ -77,8 +77,8 @@ Any upstream failure during open is fatal (see §6).
 | Field | Shape | What the pages send | Here |
 |---|---|---|---|
 | `audio` (aliases `audio_base64`, `audio_data`, `{data}`; `server.py:94-107`) | base64 raw float32, native byte order, 16 kHz mono (schema §1.3, §8) | exactly 1 s (16000 samples) per message from the AudioWorklet (`static/duplex/lib/capture-processor.js:19,62-65`, `chunkSize: SAMPLE_RATE_IN` at `omni-app.js:355-357`); file mode also 1 s (`omni-app.js:38,601`); `examples/realtime/audio_probe.py` default `--chunk-ms 1000` | converted to PCM16 LE and cut into 80 ms `input_audio_buffer.append` packets (`sglang.seq` contiguous from 0, `sglang.t_start_ms` = audio time already sent), all sent at once. A 1 s chunk is 12 packets of 80 ms + one of 40 ms, sent immediately so the unit it completes is not held back |
-| `video_frames` (alias `frame_base64_list`, `frames[]`; `server.py:75-91`) | base64 JPEG strings (schema §1.4) | one frame per 1 s chunk in the video page, full camera resolution, JPEG q=0.7 (`omni-app.js:369-374,421-437`, `realtime-session.js:257-259`) | the last frame of the message becomes one `sglang.input_image.append {image, sglang:{t_ms}}` sent **before** the chunk's audio, `t_ms` = current timeline end, i.e. the start of the unit the chunk fills. Only when the server grants `image` input and `--forward-images` is on; frames over `input_image_format.max_bytes` or a second frame for the same unit are skipped (counted in `frames_skipped`) |
-| `max_slice_nums` | int or list (schema §4.3) | `1`, or `3` with HD on | ignored |
+| `video_frames` (alias `frame_base64_list`, `frames[]`; `server.py:75-91`) | base64 JPEG strings (schema §1.4) | one frame per 1 s chunk in the video page, full camera resolution, JPEG q=0.7 (`omni-app.js:369-374,421-437`, `realtime-session.js:257-259`) | all frames are sent in list order as `sglang.input_image.append` before the chunk's audio, with the chunk start as `sglang.t_ms`. The protocol carries no per-frame capture timestamps; equal timestamps preserve list order. The advertised `input_image_format.max_per_unit` limits frames in each unit. Exceeding it fails explicitly instead of dropping all but the last frame. Image input disabled/not granted and oversized frames retain the existing counted-skip behavior. |
+| `max_slice_nums` | int or list (schema §4.3) | `1`, or `2` with HD on (overview + up to two crops) | Must match the session setting. Uniform per-frame lists are accepted; changes or mixed values require a new session and are rejected with a diagnostic. The SGLang-backed page locks HD during a session. |
 | `force_listen` (or `hints.force_listen`) | bool (`server.py:418-419`) | set on every chunk while the page's Force Listen toggle is on (`realtime-session.js:254-256,274-286`) | see [Break](#7-break--interrupt) |
 
 Cadence: py_backend handles one push at a time, prefill+generate synchronously, and the model cuts 1 s units (first unit 1035 ms in the vendored model). The sglang-omni server cuts 1 s units from media time 0 (`granted.first_unit_ms = native_unit_ms = 1000`), so a stream of 1 s chunks completes exactly one unit per chunk and no unit waits for the next chunk.
@@ -126,7 +126,24 @@ The reference model is one session per backend process and one backend per worke
 
 ## 9. Known differences from py_backend
 
-- Voice cloning (`ref_audio*`), sampling `config`, `max_slice_nums` and turn-based chat are not available (see §3).
+- Requires the SGLang-Omni sampling/reference/multiframe capabilities from private PRs #358–#360 (or an equivalent integrated revision). Unsupported explicit settings are refused by upstream; no fallback pretends they worked.
+- `length_penalty`, TTS sampling and other unmapped config fields remain unsupported. Length penalty is tracked separately in [Draft #361](https://github.com/lijrjyan/sglang-omni-private/pull/361); it is not repetition penalty.
+- HD slices are fixed per session; per-frame mixed slice limits and turn-based chat are not supported.
+- The existing camera capture still supplies one frame per second; clients supplying a frame list can now forward all frames up to the negotiated limit. No new camera frame-rate control is added.
 - `force_listen` mutes instead of forcing the model to listen (§7).
 - Metrics are round-trip times measured here, not model timings; no KV length (§5).
 - With the default silence fill, a paused page keeps the model's clock running (§4).
+
+## Validation
+
+```bash
+python -m sglang_omni_backend.test_backend
+python -m unittest sglang_omni_backend.test_controls
+npm ci
+npm test
+```
+
+The backend tests exercise actual HTTP/WebSocket messages with a simulated
+upstream, including reference WAV conversion, sampling aliases, four-frame
+ordering, overflow rejection and fixed slice settings. They are not GPU or
+browser end-to-end evidence.

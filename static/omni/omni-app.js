@@ -29,6 +29,9 @@ import {
 import { startDingDongLoop, playAlarmBell, playSessionChime } from '../duplex/lib/queue-chimes.js';
 import { createTtsRefController } from '../duplex/ui/tts-ref-controller.js';
 import { initRefAudio } from '../duplex/ui/ref-audio-init.js';
+import { mountSamplingControls } from '../duplex/ui/sampling-controls.js';
+
+const samplingControls = mountSamplingControls('omniLengthPenalty');
 
 // ============================================================================
 // Constants & State
@@ -1066,14 +1069,17 @@ function updateTimeBadge(chunks) {
 // Button State Management
 // ============================================================================
 function setButtonStates(running) {
+    samplingControls.setRunning(running, session?.backendInfo);
+    const fixedHD = session?.backendInfo?.fixed_settings?.includes('max_slice_nums');
+    document.getElementById('visionHD').disabled = running && fixedHD;
     const start = document.getElementById('btnStart');
     const fsStart = document.getElementById('fsBtnStart');
     start.disabled = running;
     document.getElementById('btnStop').disabled = !running;
     document.getElementById('btnForceListen').disabled = !running;
     document.getElementById('fsBtnForceListen').disabled = !running;
-    document.getElementById('btnHD').disabled = !running;
-    document.getElementById('fsBtnHD').disabled = !running;
+    document.getElementById('btnHD').disabled = !running || fixedHD;
+    document.getElementById('fsBtnHD').disabled = !running || fixedHD;
     if (!running) {
         start.textContent = 'Start';
         start.classList.remove('live');
@@ -1234,7 +1240,7 @@ function syncFullscreenButtons(running) {
     document.getElementById('fsBtnStart').disabled = running;
     document.getElementById('fsBtnStop').disabled = !running;
     document.getElementById('fsBtnForceListen').disabled = !running;
-    document.getElementById('fsBtnHD').disabled = !running;
+    document.getElementById('fsBtnHD').disabled = !running || session?.backendInfo?.fixed_settings?.includes('max_slice_nums');
 }
 
 function syncFullscreenQueueButtons(phase) {
@@ -1595,7 +1601,7 @@ async function startSession() {
 
     // Build prepare payload
     const preparePayload = {
-        config: { length_penalty: parseFloat(document.getElementById('omniLengthPenalty').value) || 1.0 },
+        config: { ...samplingControls.read(), length_penalty: parseFloat(document.getElementById('omniLengthPenalty').value) || 1.0 },
         max_slice_nums: getEffectiveMaxSliceNums(),
         use_tts: document.getElementById('ttsEnabled')?.checked ?? true,
     };

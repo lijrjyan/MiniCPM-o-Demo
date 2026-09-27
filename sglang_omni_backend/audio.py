@@ -8,7 +8,9 @@ sglang-omni ``/v1/realtime`` protocol carries base64 PCM16 little-endian.
 from __future__ import annotations
 
 import array
+import io
 import sys
+import wave
 
 INPUT_RATE = 16_000
 OUTPUT_RATE = 24_000
@@ -62,3 +64,18 @@ class Packetizer:
             self.seq += 1
             self.sent_samples += len(body) // 2
         return packets
+
+
+def float32_to_wav(data: bytes) -> bytes:
+    """Wrap a demo reference (16 kHz mono float32) as PCM16 WAV."""
+    if not data or len(data) % 4:
+        raise ValueError("reference audio must be non-empty raw float32 PCM")
+    if len(data) // 2 + 44 > 1024 * 1024:
+        raise ValueError("reference audio exceeds the upstream 1 MiB WAV limit")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(INPUT_RATE)
+        wav.writeframes(float32_to_pcm16(data))
+    return output.getvalue()

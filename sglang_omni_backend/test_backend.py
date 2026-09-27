@@ -3,7 +3,7 @@
     python -m sglang_omni_backend.test_backend
 
 The fake upstream enforces what sglang-omni enforces (event_id, contiguous seq and
-t_start_ms, one frame per unit, JPEG/PNG) and answers like the MiniCPM-o native
+t_start_ms, up to four frames per unit, JPEG/PNG) and answers like the MiniCPM-o native
 duplex session: one ``sglang.unit.done`` per 1 s unit, and a response spanning
 units 2-4 (``response.created``, transcript + audio deltas, ``response.done``).
 """
@@ -15,6 +15,8 @@ import array
 import base64
 import json
 import math
+import io
+import wave
 import socket
 
 import aiohttp
@@ -34,8 +36,10 @@ def free_port() -> int:
 
 
 class FakeUpstream:
-    def __init__(self, grant_image: bool = True) -> None:
+    def __init__(self, grant_image: bool = True, max_per_unit: int = 4) -> None:
         self.grant_image = grant_image
+        self.max_per_unit = max_per_unit
+        self.wire_events = []
         self.appends: list[tuple[int, float, int]] = []
         self.images: list[float] = []
         self.update: dict | None = None
@@ -57,6 +61,7 @@ class FakeUpstream:
         async for msg in ws:
             event = json.loads(msg.data)
             assert event.get("event_id"), event
+            self.wire_events.append(event)
             kind = event["type"]
             if kind == "session.update":
                 self.update = event["session"]
@@ -66,7 +71,7 @@ class FakeUpstream:
                     "input_modalities": ["audio", "image"] if self.grant_image else ["audio"],
                     "input_audio_format": {"type": "audio/pcm", "rate": 16000},
                     "output_audio_format": {"type": "audio/pcm", "rate": 24000},
-                    "input_image_format": {"types": ["image/jpeg"], "max_bytes": 524288, "max_per_unit": 1},
+                    "input_image_format": {"types": ["image/jpeg"], "max_bytes": 524288, "max_per_unit": self.max_per_unit, "max_slice_nums": 9},
                 }
                 await send({"type": "session.updated", "session": {"sglang": {"granted": granted}}})
             elif kind == "input_audio_buffer.append":
@@ -82,7 +87,7 @@ class FakeUpstream:
             elif kind == "sglang.input_image.append":
                 assert base64.b64decode(event["image"])[:2] == b"\xff\xd8"
                 unit = int(event["sglang"]["t_ms"] // 1000)
-                assert unit not in [int(t // 1000) for t in self.images], "two frames in one unit"
+                assert sum(int(t // 1000) == unit for t in self.images) < self.max_per_unit, "too many frames in one unit"
                 self.images.append(event["sglang"]["t_ms"])
             elif kind == "session.close":
                 self.closed_by_client = True
@@ -109,7 +114,7 @@ def float_chunk(seconds: float = 1.0) -> str:
     return base64.b64encode(array.array("f", [0.1 * math.sin(i / 5) for i in range(samples)]).tobytes()).decode()
 
 
-async def run_case(*, grant_image: bool, force_listen_at: int | None, pause_s: float = 0.0) -> dict:
+async def run_case(*, grant_image: bool, force_listen_at: int | None, pause_s: float = 0.0, frame_count: int = 1) -> dict:
     upstream = FakeUpstream(grant_image=grant_image)
     up_app = web.Application()
     up_app.router.add_get("/v1/realtime", upstream.handler)
@@ -128,11 +133,16 @@ async def run_case(*, grant_image: bool, force_listen_at: int | None, pause_s: f
                 assert response.status == 200, await response.text()
             ws = await http.ws_connect(f"ws://127.0.0.1:{port}/backend")
             await ws.send_str(json.dumps({"type": "session.init", "payload": {
-                "mode": "full_duplex", "system_prompt": "be brief", "config": {"length_penalty": 1.1},
+                "mode": "full_duplex", "system_prompt": "be brief", "config": {"length_penalty": 1.1, "decode_mode": "sampling", "temperature": 0.6, "text_repetition_penalty": 1.2},
                 "ref_audio_base64": float_chunk(0.1)}}))
             created = json.loads((await ws.receive()).data)
             assert created["type"] == "session.created" and created["mode"] == "full_duplex", created
-            assert upstream.update == {"output_modalities": ["audio"], "instructions": "be brief"}, upstream.update
+            assert upstream.update["output_modalities"] == ["audio"]
+            assert upstream.update["instructions"] == "be brief"
+            assert upstream.update["sglang"]["sampling"] == {"greedy": False, "temperature": 0.6, "repetition_penalty": 1.2}
+            with wave.open(io.BytesIO(base64.b64decode(upstream.update["sglang"]["reference_audio"]["data"]))) as wav:
+                assert (wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()) == (1, 2, 16000, 1600)
+            assert created["sglang"]["ignored_init_fields"] == ["config.length_penalty"]
             session_id = created["session_id"]
 
             async def reader() -> None:
@@ -144,7 +154,7 @@ async def run_case(*, grant_image: bool, force_listen_at: int | None, pause_s: f
             for index in range(7):
                 if index == 3 and pause_s:
                     await asyncio.sleep(pause_s)
-                payload = {"audio": float_chunk(), "video_frames": [base64.b64encode(JPEG).decode()]}
+                payload = {"audio": float_chunk(), "video_frames": [base64.b64encode(JPEG).decode()] * frame_count}
                 if force_listen_at is not None and index >= force_listen_at:
                     payload["force_listen"] = True
                 await ws.send_str(json.dumps({"type": "input.append", "input": payload}))
@@ -193,6 +203,13 @@ async def main() -> None:
     assert filled >= 1.0 and float(filled).is_integer(), filled  # whole units only
     assert all(t % 1000 == 0 for t in upstream.images), upstream.images  # still unit-aligned
     print("case 3 (pause -> silence fill):", filled, "s filled, timeline", starts[-1] + 40, "ms")
+    result = await run_case(grant_image=True, force_listen_at=None, frame_count=4)
+    assert result["upstream"].images == [float(unit * 1000) for unit in range(7) for _ in range(4)]
+    assert result["events"][-1]["sglang"]["frames_forwarded"] == 28
+    wire = result["upstream"].wire_events
+    first_audio = next(i for i, event in enumerate(wire) if event["type"] == "input_audio_buffer.append")
+    assert [event["type"] for event in wire[first_audio-4:first_audio]] == ["sglang.input_image.append"] * 4
+    print("case 4 (four frames per unit): 28 frames forwarded before their audio")
     print("OK")
 
 

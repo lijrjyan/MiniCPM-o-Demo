@@ -30,6 +30,7 @@ export class RealtimeSession {
             getPlaybackDelayMs: this.config.getPlaybackDelayMs,
         });
         this.sessionId = '';
+        this.backendInfo = null;
         this.recordingSessionId = '';
         this.chunksSent = 0;
         this.paused = false;
@@ -107,6 +108,7 @@ export class RealtimeSession {
     async start(systemPrompt, preparePayload, startMediaFn) {
         this._reset();
         this.sessionId = '';
+        this.backendInfo = null;
         this.recordingSessionId = '';
         this.onMetrics({ type: 'state', sessionState: 'Connecting...' });
 
@@ -194,6 +196,13 @@ export class RealtimeSession {
                     } else if (msg.type === 'session.created') {
                         this._queueReject = null;
                         this.sessionId = msg.session_id || '';
+                        this.backendInfo = msg.sglang || null;
+                        if (this.backendInfo?.ignored_init_fields?.length) {
+                            this.onSystemLog(`Unsupported settings: ${this.backendInfo.ignored_init_fields.join(', ')}`);
+                        }
+                        if (this.backendInfo?.fixed_settings?.includes('max_slice_nums')) {
+                            this.onSystemLog('HD slices are fixed for this session. Stop and restart to change them.');
+                        }
                         this.recordingSessionId = this.sessionId;
                         this._logProtoEvent('server', 'session.created',
                             `session_id=${this.sessionId}`, msg);
@@ -201,6 +210,9 @@ export class RealtimeSession {
                         this.onMetrics({ type: 'state', sessionId: this.sessionId });
                         this.onSystemLog(`Session created: ${this.sessionId} (${msg.prompt_length || '?'} tokens)`);
                         resolve();
+                    } else if (msg.type === 'session.closed') {
+                        this._queueReject = null;
+                        reject(new Error(msg.diagnostic?.message || msg.reason || 'Session initialization failed'));
                     } else if (msg.type === 'error') {
                         this._queueReject = null;
                         this._logProtoEvent('server', 'error',

@@ -31,7 +31,7 @@ from typing import Any, Optional
 import aiohttp
 from aiohttp import web
 
-from .audio import INPUT_RATE, OUTPUT_RATE, Packetizer, float32_to_pcm16, pcm16_to_float32
+from .audio import INPUT_RATE, OUTPUT_RATE, Packetizer, float32_to_pcm16, float32_to_wav, pcm16_to_float32
 
 log = logging.getLogger("sglang_omni_backend.session")
 
@@ -121,7 +121,9 @@ class BackendSession:
         self._anchor_wall: Optional[float] = None  # wall time of the last real chunk; None before the first
         self._anchor_ms = 0.0
         self._unit_input_done: dict[int, float] = {}
-        self._units_with_frame: set[int] = set()
+        self._unit_frame_counts: dict[int, int] = {}
+        self.image_max_per_unit = 1
+        self.max_slice_nums = 1
         self._units_emitted: set[int] = set()
         self._sent_kinds: "OrderedDict[str, str]" = OrderedDict()
         self.current_response: Optional[str] = None
@@ -165,13 +167,46 @@ class BackendSession:
             raise ProtocolViolation("system_prompt must be a string")
         use_tts = params.get("use_tts", True)
         modalities = ["text"] if use_tts is False else ["audio"]
-        voice = params.get("voice") if isinstance(params.get("voice"), dict) else {}
-        for key in ("ref_audio", "ref_audio_base64", "tts_ref_audio", "tts_ref_audio_base64", "ref_audio_path"):
-            if params.get(key) or voice.get(key):
-                self.ignored_init_fields.append(key)
-        for key in ("config", "max_slice_nums"):
-            if params.get(key):
-                self.ignored_init_fields.append(key)
+        config = params.get("config") or {}
+        if not isinstance(config, dict):
+            raise ProtocolViolation("config must be an object")
+        sampling = {}
+        sampling_fields = {
+            "temperature": "temperature", "top_k": "top_k", "top_p": "top_p",
+            "text_repetition_penalty": "repetition_penalty",
+            "repetition_penalty": "repetition_penalty",
+            "listen_prob_scale": "listen_prob_scale",
+            "force_listen_count": "force_listen_count", "greedy": "greedy",
+        }
+        for key, value in config.items():
+            if key in sampling_fields:
+                sampling[sampling_fields[key]] = value
+            elif key == "decode_mode":
+                if value not in ("sampling", "greedy"):
+                    raise ProtocolViolation("decode_mode must be sampling or greedy")
+                sampling["greedy"] = value == "greedy"
+            else:
+                self.ignored_init_fields.append(f"config.{key}")
+        extension = {}
+        if sampling:
+            extension["sampling"] = sampling
+        self.max_slice_nums = params.get("max_slice_nums", 1)
+        if "max_slice_nums" in params:
+            extension["max_slice_nums"] = self.max_slice_nums
+        voice = params.get("voice") or {}
+        if not isinstance(voice, dict):
+            raise ProtocolViolation("voice must be an object")
+        if params.get("ref_audio_path") or voice.get("ref_audio_path"):
+            raise ProtocolViolation("reference audio must be uploaded, not a server file path")
+        for source, target in (("ref_audio", "reference_audio"), ("tts_ref_audio", "tts_reference_audio")):
+            reference = (params.get(f"{source}_base64") or params.get(source)
+                         or voice.get(f"{source}_base64") or voice.get(source))
+            if reference:
+                try:
+                    wav = float32_to_wav(base64.b64decode(reference, validate=True))
+                except (binascii.Error, ValueError, TypeError) as exc:
+                    raise ProtocolViolation(f"invalid {source}: {exc}") from exc
+                extension[target] = {"media_type": "audio/wav", "data": base64.b64encode(wav).decode("ascii")}
 
         self._http = aiohttp.ClientSession()
         self._up = await self._http.ws_connect(
@@ -184,6 +219,8 @@ class BackendSession:
         created = await self._recv_until("session.created")
         self.upstream_session_id = (created.get("session") or {}).get("id")
         session: dict[str, Any] = {"output_modalities": modalities}
+        if extension:
+            session["sglang"] = extension
         if instructions:
             session["instructions"] = instructions
         await self._send_up("session.update", "control", session=session)
@@ -199,6 +236,7 @@ class BackendSession:
         image_format = self.granted.get("input_image_format") or {}
         self.image_enabled = self.config.forward_images and "image" in (self.granted.get("input_modalities") or [])
         self.image_max_bytes = int(image_format.get("max_bytes") or 0)
+        self.image_max_per_unit = int(image_format.get("max_per_unit", 1))
         self._tasks = [asyncio.create_task(self._receiver(), name=f"{self.session_id}-recv")]
         if self.config.silence_fill:
             self._tasks.append(asyncio.create_task(self._pacer(), name=f"{self.session_id}-pacer"))
@@ -216,6 +254,10 @@ class BackendSession:
                 "upstream_session_id": self.upstream_session_id,
                 "native_unit_ms": self.unit_ms,
                 "image_input": self.image_enabled,
+                "max_images_per_unit": self.image_max_per_unit,
+                "max_slice_nums": self.max_slice_nums,
+                "fixed_settings": ["max_slice_nums"],
+                "sampling": sampling,
                 "output_modalities": modalities,
                 "ignored_init_fields": self.ignored_init_fields,
             },
@@ -315,12 +357,21 @@ class BackendSession:
         pcm = float32_to_pcm16(raw)
         frames = _extract_frames(payload)
         hints = payload.get("hints") if isinstance(payload.get("hints"), dict) else {}
+        slice_nums = payload.get("max_slice_nums", hints.get("max_slice_nums", self.max_slice_nums))
+        slice_values = slice_nums if isinstance(slice_nums, list) else [slice_nums]
+        if isinstance(slice_nums, list) and len(slice_nums) != len(frames):
+            raise ProtocolViolation("max_slice_nums must have one entry per frame")
+        if any(type(value) is not int or value != self.max_slice_nums for value in slice_values):
+            raise ProtocolViolation("max_slice_nums is fixed at session.init; reconnect to change HD slices")
         self._set_force_listen(bool(payload.get("force_listen", hints.get("force_listen", False))))
         async with self._input_lock:
             self.stats["pushes"] += 1
             self.stats["input_audio_s"] += len(pcm) / 2 / INPUT_RATE
-            if frames:
-                await self._send_frame(frames[-1], dropped=len(frames) - 1)
+            unit = math.floor(self.packetizer.sent_ms / self.unit_ms)
+            if self.image_enabled and self._unit_frame_counts.get(unit, 0) + len(frames) > self.image_max_per_unit:
+                raise ProtocolViolation(f"unit frame count exceeds upstream limit {self.image_max_per_unit}")
+            for frame in frames:
+                await self._send_frame(frame)
             if pcm:
                 await self._send_audio(pcm)
             self._anchor_wall = time.monotonic()
@@ -339,8 +390,7 @@ class BackendSession:
             log.info("session %s force_listen on: muting %s", self.session_id, self.current_response if self.response_active else None)
         self.force_listen = active
 
-    async def _send_frame(self, frame_b64: str, *, dropped: int) -> None:
-        self.stats["frames_skipped"] += dropped
+    async def _send_frame(self, frame_b64: str) -> None:
         if not self.image_enabled:
             self.stats["frames_skipped"] += 1
             return
@@ -350,10 +400,10 @@ class BackendSession:
             size = len(base64.b64decode(frame_b64, validate=True))
         except (binascii.Error, ValueError) as exc:
             raise ProtocolViolation(f"video frame is not base64: {exc}") from exc
-        if unit in self._units_with_frame or (self.image_max_bytes and size > self.image_max_bytes):
+        if self.image_max_bytes and size > self.image_max_bytes:
             self.stats["frames_skipped"] += 1
             return
-        self._units_with_frame.add(unit)
+        self._unit_frame_counts[unit] = self._unit_frame_counts.get(unit, 0) + 1
         await self._send_up("sglang.input_image.append", "image", image=frame_b64, sglang={"t_ms": t_ms})
         self.stats["frames_forwarded"] += 1
 
@@ -488,7 +538,7 @@ class BackendSession:
             if unit is not None:
                 self._units_emitted.discard(unit)
                 self._unit_input_done.pop(unit, None)
-                self._units_with_frame.discard(unit)
+                self._unit_frame_counts.pop(unit, None)
         elif kind == "error":
             error = event.get("error") or {}
             source = self._sent_kinds.get(error.get("event_id") or event.get("client_event_id") or "")
