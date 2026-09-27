@@ -93,6 +93,7 @@ Browser -> Gateway -> Python Worker -> Backend
 - **Gateway** 是对外的 HTTPS/WebSocket 入口，不加载模型，负责路由、排队、session 录制和 worker 健康检查。
 - **Python Worker** 暴露 worker WebSocket/health API，维护 worker 状态，并把 runtime protocol 消息转发给 backend server。
 - **Backend** 负责实际模型推理。Backend 可以是 PyTorch 实现（`py_backend/server.py`），也可以是 C++ 实现（`llama.cpp-omni` 的 `llama-omni-server`）。
+  也可以是一个现成的 [sglang-omni](https://github.com/sgl-project/sglang-omni) 服务，通过 `sglang_omni_backend/` 桥接（仅全双工；见 `sglang_omni_backend/BACKEND.md`）。
 
 **Docker 部署（推荐）**
 
@@ -135,6 +136,19 @@ docker compose -f docker-compose.cpp.yml logs -f cpp-worker-backend
 ```
 
 C++ backend 推荐入口是 `docker-compose.cpp.yml`。它使用 `docker/Dockerfile.cpp-worker-backend` 和 `docker/entrypoint-cpp-worker-backend.sh` 定义的 C++ worker 镜像；llama.cpp-omni ref、backend 启动命令和默认 `LLAMA_SERVER_EXTRA_ARGS` 以这些文件为准。
+
+**通过 Compose 使用 sglang-omni 后端**（带模型的 sglang-omni 服务单独运行，本容器不需要 GPU）：
+
+```bash
+mkdir -p certs data
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout certs/key.pem -out certs/cert.pem -subj "/CN=minicpm-o"
+
+UPSTREAM_URL=ws://host.docker.internal:18260/v1/realtime \
+docker compose -f docker-compose.sglang-omni.yml up -d --build
+```
+
+裸机：`scripts/sglang_omni_local.sh start`（设置见 `scripts/sglang_omni_local.env` 与脚本头部注释）。
 
 **裸机部署：**
 
